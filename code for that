@@ -1,0 +1,268 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.neighbors import NearestNeighbors
+import random
+import warnings
+
+warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
+warnings.filterwarnings('ignore', category=FutureWarning)
+
+def load_data(filepath):
+    try:
+        df = pd.read_csv(filepath)
+        df['SpecialNeeds'] = df['SpecialNeeds'].fillna('None').astype(str)
+        df['AllergenInfo'] = df['AllergenInfo'].fillna('None').astype(str)
+        df['KeyIngredient'] = df['KeyIngredient'].fillna('Unknown').astype(str)
+        df['Size'] = df['Size'].fillna('All').astype(str)
+        df['LifeStage'] = df['LifeStage'].fillna('All Life Stages').astype(str)
+
+        df['Size_list'] = df['Size'].apply(lambda x: [s.strip() for s in str(x).split(',')])
+        df['SpecialNeeds_list'] = df['SpecialNeeds'].apply(lambda x: [s.strip() for s in str(x).split(',') if s.strip().lower() != 'none'])
+        return df
+    except FileNotFoundError:
+        print(f"Error: File not found at {filepath}")
+        return None
+    except Exception as e:
+        print(f"Error loading or processing data: {e}")
+        return None
+
+def get_pet_profile():
+    print("Please enter your pet's details:")
+    species = input("Species (Dog/Cat): ").strip().capitalize()
+    while species not in ['Dog', 'Cat']:
+        print("Invalid species. Please enter 'Dog' or 'Cat'.")
+        species = input("Species (Dog/Cat): ").strip().capitalize()
+
+    age_input = input("Life Stage (Puppy/Kitten, Adult, Senior): ").strip().capitalize()
+    valid_stages = ['Puppy', 'Kitten', 'Adult', 'Senior']
+    while age_input not in valid_stages:
+         print("Invalid life stage.")
+         age_input = input("Life Stage (Puppy/Kitten, Adult, Senior): ").strip().capitalize()
+
+    if species == 'Dog' and age_input == 'Kitten':
+        print("Warning: Dog selected, changing Life Stage from Kitten to Puppy.")
+        age_input = 'Puppy'
+    elif species == 'Cat' and age_input == 'Puppy':
+        print("Warning: Cat selected, changing Life Stage from Puppy to Kitten.")
+        age_input = 'Kitten'
+
+    pet_lifestage = [age_input, 'All Life Stages']
+
+    size_input = input("Size (Small, Medium, Large): ").strip().capitalize()
+    while size_input not in ['Small', 'Medium', 'Large']:
+        print("Invalid size.")
+        size_input = input("Size (Small, Medium, Large): ").strip().capitalize()
+    pet_size = [size_input, 'All']
+
+    allergies_input = input("Known Allergies (comma-separated, e.g., Chicken, Grain, None): ").strip()
+    allergies = [a.strip().lower() for a in allergies_input.split(',') if a.strip() and a.strip().lower() != 'none']
+
+    special_needs_input = input("Special Needs (comma-separated, e.g., Weight Management, Sensitive Skin, None): ").strip()
+    special_needs = [sn.strip() for sn in special_needs_input.split(',') if sn.strip() and sn.strip().lower() != 'none']
+
+    pet_profile = {
+        'Species': species,
+        'LifeStage_possible': pet_lifestage,
+        'Size_possible': pet_size,
+        'Allergies': allergies,
+        'SpecialNeeds_list': special_needs,
+        'LifeStage': age_input,
+        'Size': size_input
+    }
+    return pet_profile
+
+def preprocess_for_knn(df):
+    if df.empty:
+         return pd.DataFrame(), [], []
+
+    df_processed = df.copy()
+
+    life_stages_present = df_processed['LifeStage'].unique()
+    for stage in life_stages_present:
+        df_processed[f'LifeStage_{stage}'] = df_processed['LifeStage'].apply(lambda x: 1 if x == stage else 0)
+
+    all_sizes_present = set(s for sizes in df_processed['Size_list'] if isinstance(sizes, list) for s in sizes)
+    for size in all_sizes_present:
+         df_processed[f'Size_{size}'] = df_processed['Size_list'].apply(lambda x: 1 if isinstance(x, list) and size in x else 0)
+
+    mlb_needs = MultiLabelBinarizer()
+    df_processed['SpecialNeeds_list'] = df_processed['SpecialNeeds_list'].apply(lambda x: x if isinstance(x, list) else [])
+    needs_encoded = mlb_needs.fit_transform(df_processed['SpecialNeeds_list'])
+    needs_feature_names = [f'Needs_{cls}' for cls in mlb_needs.classes_]
+    needs_df = pd.DataFrame(needs_encoded, columns=needs_feature_names, index=df_processed.index)
+
+    df_final = pd.concat([df_processed, needs_df], axis=1)
+
+    feature_cols = [col for col in df_final.columns if col.startswith('LifeStage_') or col.startswith('Size_') or col.startswith('Needs_')]
+
+    return df_final, feature_cols, mlb_needs.classes_
+
+def filter_foods(df, pet_profile):
+    df_filtered = df[df['Species'] == pet_profile['Species']].copy()
+    if df_filtered.empty:
+        print(f"Info: No foods found for species '{pet_profile['Species']}'.")
+        return pd.DataFrame()
+
+    foods_to_exclude_indices = []
+    for index, food in df_filtered.iterrows():
+        allergen_info_str = str(food.get('AllergenInfo', 'None'))
+        special_needs_str = str(food.get('SpecialNeeds', 'None'))
+        key_ingredient_str = str(food.get('KeyIngredient', 'Unknown')).lower()
+
+        is_hypoallergenic = 'Hypoallergenic' in allergen_info_str or 'Allergies' in special_needs_str
+        contains_allergen = False
+
+        for allergen in pet_profile['Allergies']:
+            allergen_lower = allergen.lower()
+            is_key_ingredient_allergen = allergen_lower == key_ingredient_str
+
+            if allergen_lower == 'grain' and 'Grain-Free' not in allergen_info_str and not is_hypoallergenic:
+                contains_allergen = True; break
+            elif allergen_lower != 'grain' and is_key_ingredient_allergen and not is_hypoallergenic:
+                 contains_allergen = True; break
+            elif allergen_lower != 'grain' and allergen_lower in allergen_info_str.lower() and not is_hypoallergenic:
+                 contains_allergen = True; break
+            elif is_hypoallergenic and is_key_ingredient_allergen:
+                 contains_allergen = True; break
+
+        if contains_allergen:
+            foods_to_exclude_indices.append(index)
+
+    if foods_to_exclude_indices:
+        df_filtered.drop(foods_to_exclude_indices, inplace=True)
+
+    if df_filtered.empty:
+         print(f"Info: All {pet_profile['Species']} foods were excluded due to allergy constraints ({', '.join(pet_profile['Allergies'])}).")
+
+    return df_filtered
+
+def recommend_food_knn(pet_profile, food_df_full, n_recommendations=5):
+    eligible_foods_filtered = filter_foods(food_df_full, pet_profile)
+
+    if eligible_foods_filtered.empty:
+        return []
+
+    eligible_foods_processed, feature_cols, needs_classes = preprocess_for_knn(eligible_foods_filtered)
+
+    if not feature_cols or eligible_foods_processed.empty:
+        print("Warning: Could not generate features for KNN or no eligible foods left after processing.")
+        return eligible_foods_filtered[['FoodName', 'FoodID']].values.tolist()[:n_recommendations]
+
+    try:
+        food_features = eligible_foods_processed[feature_cols].values.astype(float)
+    except Exception as e:
+         print(f"Error converting food features to float: {e}")
+         print("Data causing issues:")
+         print(eligible_foods_processed[feature_cols].info())
+         print(eligible_foods_processed[feature_cols].head())
+         return []
+
+    pet_feature_vector = np.zeros(len(feature_cols), dtype=float)
+    col_idx_map = {name: i for i, name in enumerate(feature_cols)}
+
+    pet_stage_col = f'LifeStage_{pet_profile["LifeStage"]}'
+    if pet_stage_col in col_idx_map:
+         pet_feature_vector[col_idx_map[pet_stage_col]] = 1.0
+    elif 'LifeStage_All Life Stages' in col_idx_map:
+         pet_feature_vector[col_idx_map['LifeStage_All Life Stages']] = 1.0
+
+    pet_size_col = f'Size_{pet_profile["Size"]}'
+    if pet_size_col in col_idx_map:
+        pet_feature_vector[col_idx_map[pet_size_col]] = 1.0
+    if 'Size_All' in col_idx_map:
+        pet_feature_vector[col_idx_map['Size_All']] = 1.0
+
+    for need in pet_profile['SpecialNeeds_list']:
+         need_col = f'Needs_{need}'
+         if need_col in col_idx_map:
+              pet_feature_vector[col_idx_map[need_col]] = 1.0
+
+    k = min(n_recommendations, len(eligible_foods_processed))
+    if k <= 0:
+        print("Info: No eligible foods remain to run KNN after processing.")
+        return []
+
+    try:
+        knn = NearestNeighbors(n_neighbors=k, metric='cosine')
+        knn.fit(food_features)
+        distances, indices = knn.kneighbors(pet_feature_vector.reshape(1, -1))
+
+        recommended_original_indices = eligible_foods_processed.iloc[indices[0]].index
+
+        recommendations_df = food_df_full.loc[recommended_original_indices]
+
+        return recommendations_df[['FoodName', 'FoodID']].values.tolist()
+
+    except Exception as e:
+        print(f"Error during KNN fitting or prediction: {e}")
+        print("Food Features Shape:", food_features.shape)
+        print("Pet Vector Shape:", pet_feature_vector.reshape(1, -1).shape)
+        return []
+
+def mock_api_call(food_id, df):
+     try:
+        food_id_int = int(food_id)
+        food_info = df[df['FoodID'] == food_id_int]
+     except ValueError:
+         print(f"Warning: Invalid FoodID format '{food_id}' for API call.")
+         return {'protein': random.randint(20,35), 'fat': random.randint(8, 20), 'source': 'Mock API Fallback (Invalid ID)'}
+
+     if not food_info.empty:
+         protein = food_info['MockAPI_Protein'].iloc[0]
+         fat = food_info['MockAPI_Fat'].iloc[0]
+         protein = pd.to_numeric(protein, errors='coerce')
+         fat = pd.to_numeric(fat, errors='coerce')
+         protein = protein if pd.notna(protein) else random.randint(20,35)
+         fat = fat if pd.notna(fat) else random.randint(8, 20)
+         source = 'Mock API Data' if pd.notna(protein) and pd.notna(fat) else 'Mock API Data (Defaults Used)'
+         return {'protein': protein, 'fat': fat, 'source': source}
+     else:
+         return {'protein': random.randint(20,35), 'fat': random.randint(8, 20), 'source': 'Mock API Fallback (ID Not Found)'}
+
+def display_recommendations(recommendations_list, food_df_full):
+    if not recommendations_list:
+        return
+
+    print("\nTop Pet Food Recommendations (Using KNN):")
+    print("-" * 40)
+
+    processed_ids = set()
+    count = 0
+    for food_name, food_id in recommendations_list:
+         if food_id in processed_ids:
+             continue
+
+         try:
+             food_details = food_df_full[food_df_full['FoodID'] == food_id].iloc[0]
+             count += 1
+             print(f"{count}. {food_details['FoodName']} (ID: {food_details['FoodID']})")
+             print(f"   - Species: {food_details['Species']}, Life Stage: {food_details['LifeStage']}, Size: {food_details['Size']}")
+             print(f"   - Key Ingredient: {food_details['KeyIngredient']}")
+             print(f"   - Special Needs Focus: {food_details['SpecialNeeds']}")
+             print(f"   - Allergen Info: {food_details['AllergenInfo']}")
+
+             api_data = mock_api_call(food_id, food_df_full)
+             print(f"   - Nutritional Info (Mock API): Protein ~{api_data.get('protein','N/A')}%, Fat ~{api_data.get('fat','N/A')}% ({api_data.get('source','N/A')})")
+             print("-" * 15)
+             processed_ids.add(food_id)
+
+         except IndexError:
+             print(f"Warning: Could not find details for recommended FoodID {food_id} in the original dataset. Skipping.")
+         except Exception as e:
+              print(f"Warning: Error displaying details for FoodID {food_id}: {e}. Skipping.")
+
+if _name_ == "_main_":
+    text_file = 'pet_food_data.txt'
+    food_database = load_data(text_file)
+
+    if food_database is not None:
+        user_pet_profile = get_pet_profile()
+        print("\nCalculating recommendations using KNN...")
+
+        recommended_foods_list = recommend_food_knn(user_pet_profile, food_database, n_recommendations=5)
+
+        if recommended_foods_list:
+             display_recommendations(recommended_foods_list, food_database)
+    else:
+        print("Exiting due to data loading error.")
